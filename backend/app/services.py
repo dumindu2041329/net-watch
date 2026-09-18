@@ -780,11 +780,46 @@ async def run_bandwidth_cycle() -> None:
     snapshots = await asyncio.to_thread(bandwidth_sampler.snapshot)
     if not snapshots:
         return
-    # Fold these rates into the traffic history bucket. A closed bucket means the
-    # hour shard changed, so it is uploaded once per bucket — never per sample.
+    # Fold these rates into the traffic history bucket. A closed bucket means
+    # the hour shard changed and wants uploading — but that upload is a
+    # blocking Supabase Storage HTTP call that routinely outlasts this job's
+    # 2 s interval, which used to stall the cycle and spam "maximum number of
+    # running instances reached (1)" skips. Hand it to a guarded background
+    # task instead so this job always finishes in milliseconds.
     if traffic_history.record(snapshots):
-        await asyncio.to_thread(traffic_history.flush)
+        _schedule_traffic_flush()
     await publish("bandwidth", bandwidth_payload())
+
+
+# Serializes traffic-history uploads: Storage has no retention/completion
+# guarantees of its own, so a slow or stalled upload must never stack more
+# uploads behind it — shards simply stay dirty and ride along next time.
+_flush_lock = asyncio.Lock()
+
+
+def _schedule_traffic_flush() -> None:
+    """Upload dirty traffic shards in the background (fire-and-forget).
+
+    Skipped outright when the previous upload is still in flight. Durability
+    does not depend on this: lifespan shutdown always performs a final
+    synchronous flush, and failed shards stay dirty for the next attempt.
+    """
+    if _flush_lock.locked():
+        return
+
+    async def _flush() -> None:
+        async with _flush_lock:
+            try:
+                await asyncio.to_thread(traffic_history.flush)
+            except Exception:
+                logger.exception("Background traffic-history flush failed")
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return  # no loop (tests/shutdown) — the shutdown flush covers it
+    task = loop.create_task(_flush())
+    task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
 
 
 async def run_lan_traffic_cycle() -> None:

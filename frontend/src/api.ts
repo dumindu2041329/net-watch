@@ -104,37 +104,111 @@ export const getInterfaces = () => http<{ interfaces: NetworkInterface[] }>('/ba
 
 export type LiveEvent = { type: string; payload: unknown }
 
+type LiveHandler = (event: LiveEvent) => void;
+
+// One shared socket for the whole app (App's scan listener + DevicesPage's
+// devices listener previously opened a socket each). Fewer sockets means
+// fewer aborted proxy connections in dev.
+const liveHandlers = new Set<LiveHandler>()
+let liveSocket: WebSocket | null = null
+let liveRetry: ReturnType<typeof setTimeout> | null = null
+let liveIdleClose: ReturnType<typeof setTimeout> | null = null
+
+// Grace period before closing an unreferenced socket. React StrictMode mounts
+// every effect twice (connect → cleanup → reconnect) and HMR swaps remount
+// components the same way; without this grace each of those cycles aborts a
+// socket mid-handshake, which is exactly what Vite logs as
+// "ws proxy socket error: write ECONNABORTED". Reuse within the window means
+// steady-state dev usage opens one socket and never aborts it.
+const LIVE_IDLE_CLOSE_MS = 1500
+const LIVE_RETRY_MS = 3000
+
+function openLiveSocket(): void {
+  if (liveSocket || liveRetry) return
+  const proto = window.location.protocol === 'https:' ? 'wss' : 'ws'
+  const socket = new WebSocket(`${proto}://${window.location.host}/ws`)
+  liveSocket = socket
+  socket.onmessage = (e) => {
+    let event: LiveEvent
+    try {
+      event = JSON.parse(e.data) as LiveEvent
+    } catch {
+      // ignore malformed frames
+      return
+    }
+    liveHandlers.forEach((handler) => {
+      try {
+        handler(event)
+      } catch {
+        // one bad subscriber must not break fan-out to the rest
+      }
+    })
+  }
+  socket.onclose = () => {
+    liveSocket = null
+    // Nobody left to serve (all unsubscribed during an outage) — stay down.
+    if (liveHandlers.size === 0) return
+    if (liveRetry) return
+    liveRetry = setTimeout(() => {
+      liveRetry = null
+      openLiveSocket()
+    }, LIVE_RETRY_MS)
+  }
+  // Browsers fire error alongside close; drive everything through onclose so
+  // there is exactly one reconnect path.
+  socket.onerror = () => {
+    try {
+      socket.close()
+    } catch {
+      // already gone — onclose handles the retry
+    }
+  }
+}
+
+function closeLiveSocketIfIdle(): void {
+  if (liveHandlers.size > 0) return
+  if (liveRetry) {
+    clearTimeout(liveRetry)
+    liveRetry = null
+  }
+  const socket = liveSocket
+  liveSocket = null
+  liveIdleClose = null
+  if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) {
+    try {
+      // Clean close handshake — unlike an abort, this does not surface as a
+      // proxy socket error on either side.
+      socket.close(1000, 'idle')
+    } catch {
+      // already gone
+    }
+  }
+}
+
 /**
  * Subscribe to real-time push events from the backend WebSocket.
  * Returns an unsubscribe function. Automatically reconnects.
+ *
+ * All subscribers share a single underlying socket (reference-counted); the
+ * last unsubscribe only closes it after a short grace period so StrictMode
+ * remounts and HMR swaps reuse the live connection.
  */
-export function subscribeLive(onEvent: (event: LiveEvent) => void): () => void {
-  let closed = false
-  let ws: WebSocket | null = null
-  let retry: ReturnType<typeof setTimeout> | null = null
-
-  const connect = () => {
-    if (closed) return
-    const proto = window.location.protocol === 'https:' ? 'wss' : 'ws'
-    ws = new WebSocket(`${proto}://${window.location.host}/ws`)
-    ws.onmessage = (e) => {
-      try {
-        onEvent(JSON.parse(e.data) as LiveEvent)
-      } catch {
-        // ignore malformed frames
-      }
-    }
-    ws.onclose = () => {
-      ws = null
-      retry = setTimeout(connect, 3000)
-    }
+export function subscribeLive(onEvent: LiveHandler): () => void {
+  liveHandlers.add(onEvent)
+  if (liveIdleClose) {
+    clearTimeout(liveIdleClose)
+    liveIdleClose = null
   }
-
-  connect()
+  if (liveRetry) {
+    clearTimeout(liveRetry)
+    liveRetry = null
+  }
+  openLiveSocket()
   return () => {
-    closed = true
-    if (ws) ws.close()
-    if (retry) clearTimeout(retry)
+    liveHandlers.delete(onEvent)
+    if (liveHandlers.size === 0 && !liveIdleClose) {
+      liveIdleClose = setTimeout(closeLiveSocketIfIdle, LIVE_IDLE_CLOSE_MS)
+    }
   }
 }
 
