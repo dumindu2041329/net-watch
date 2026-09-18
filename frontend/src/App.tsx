@@ -1,7 +1,7 @@
 import { lazy, Suspense, useState, useEffect, useCallback } from 'react'
 import type { ComponentType } from 'react'
 import type { PageId, AlertResponse, ScanResult, LoginResponse } from './types'
-import { getAlerts, logout, scanNetwork } from './api'
+import { getAlerts, logout, scanNetwork, subscribeLive } from './api'
 import TopBar from './components/TopBar'
 import Sidebar from './components/Sidebar'
 import LoginPage from './pages/LoginPage'
@@ -69,6 +69,27 @@ export default function App() {
     return () => clearInterval(id)
   }, [accessToken])
 
+  // Automatic scans (scheduler + network watcher) also publish `scan` events.
+  // Surface a network change instantly even when the user never pressed SCAN.
+  useEffect(() => {
+    if (!accessToken) return
+    const unsub = subscribeLive((e) => {
+      if (e.type !== 'scan') return
+      const p = e.payload as ScanResult | null
+      if (p && p.network_changed) {
+        setScanVersion(v => v + 1)
+        const cleared = p.cleared_devices || 0
+        setToast(
+          cleared > 0
+            ? `Network changed — cleared ${cleared} old device${cleared !== 1 ? 's' : ''}. Found ${p.devices_found} on the new network.`
+            : `Network changed — showing the new network (${p.devices_found} devices).`
+        )
+        setTimeout(() => setToast(null), 5000)
+      }
+    })
+    return unsub
+  }, [accessToken])
+
   const handleScan = useCallback(async () => {
     if (scanning || !accessToken) return
     setScanning(true)
@@ -76,7 +97,12 @@ export default function App() {
     const result: ScanResult | null = await scanNetwork()
     if (result) {
       setScanVersion(v => v + 1)
-      const msg = `Found ${result.devices_found} device${result.devices_found !== 1 ? 's' : ''} (${result.new_devices} new) in ${result.scan_duration_ms}ms`
+      const base = `Found ${result.devices_found} device${result.devices_found !== 1 ? 's' : ''} (${result.new_devices} new) in ${result.scan_duration_ms}ms`
+      const msg = result.network_changed && (result.cleared_devices || 0) > 0
+        ? `Network changed — cleared ${result.cleared_devices} old device${result.cleared_devices !== 1 ? 's' : ''}. ${base}`
+        : result.network_changed
+          ? `Network changed — old devices cleared. ${base}`
+          : base
       setToast(msg)
       setTimeout(() => setToast(null), 5000)
     }

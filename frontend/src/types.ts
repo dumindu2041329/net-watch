@@ -86,6 +86,9 @@ export interface ScanResult {
   new_devices: number;
   scan_duration_ms: number;
   timestamp: string;
+  network_cidr?: string;
+  network_changed?: boolean;
+  cleared_devices?: number;
 }
 
 export interface WifiInfo {

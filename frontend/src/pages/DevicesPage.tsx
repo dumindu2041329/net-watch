@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
 import type { Device } from '../types'
-import { getDevices } from '../api'
+import { getDevices, subscribeLive } from '../api'
 import StatusBadge from '../components/StatusBadge'
 import PingBar from '../components/PingBar'
 
@@ -18,6 +18,21 @@ export default function DevicesPage({ scanVersion, token }: { scanVersion?: numb
     const id = setInterval(fetchDevices, 5000)
     return () => clearInterval(id)
   }, [token])
+
+  // Live push: the backend publishes the full inventory after every ping
+  // cycle and every scan, so a network change renders in ~1 s instead of
+  // waiting for the next 5 s poll.
+  useEffect(() => {
+    const unsub = subscribeLive((e) => {
+      if (e.type !== 'devices') return
+      const payload = e.payload as { devices?: Device[] } | null
+      if (payload && Array.isArray(payload.devices)) {
+        setDevices(payload.devices)
+        setPage(1)
+      }
+    })
+    return unsub
+  }, [])
 
   useEffect(() => {
     if (scanVersion && scanVersion > 0) {
@@ -114,7 +129,18 @@ export default function DevicesPage({ scanVersion, token }: { scanVersion?: numb
               ))}
               {filtered.length === 0 && (
                 <tr><td colSpan={12} className="text-center text-muted p-[30px] text-[13px]">
-                  {devices.length === 0 ? 'No devices discovered yet. The scanner runs every 30s — wireless clients appear here automatically.' : 'No devices match your search.'}
+                  {devices.length === 0 ? 'No devices discovered yet. The scanner runs every 30s — wireless clients appear here automatically.' : (
+                    <span>
+                      No devices match your search.{' '}
+                      <button
+                        onClick={() => { setSearch(''); setPage(1) }}
+                        className="underline text-accent hover:text-accent2 transition-colors"
+                      >
+                        Clear search
+                      </button>{' '}
+                      (tip: after switching networks, an old IP filter hides the new devices)
+                    </span>
+                  )}
                 </td></tr>
               )}
             </tbody>

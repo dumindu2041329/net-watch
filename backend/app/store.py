@@ -50,6 +50,7 @@ _load_failed = False
 _retry_at = 0.0
 _devices: list["Device"] = []
 _alerts: list["Alert"] = []
+_network: dict | None = None
 _seq = {"device": 0, "alert": 0}
 _last_saved = ""
 
@@ -151,6 +152,7 @@ def _state_body() -> dict:
     return {
         "device_seq": _seq["device"],
         "alert_seq": _seq["alert"],
+        "network": dict(_network) if _network else None,
         "devices": [_device_to_dict(d) for d in _devices],
         "alerts": [_alert_to_dict(a) for a in _alerts],
     }
@@ -317,7 +319,7 @@ def load(force: bool = False) -> None:
     Retries are rate limited so a storage outage cannot turn into a request
     storm; once a read succeeds the in-memory state is trusted again.
     """
-    global _loaded, _load_failed, _retry_at, _devices, _alerts, _last_saved
+    global _loaded, _load_failed, _retry_at, _devices, _alerts, _network, _last_saved
     with _lock:
         if _loaded and not force:
             return
@@ -334,6 +336,8 @@ def load(force: bool = False) -> None:
             return
         _devices = [_device_from_dict(item) for item in document.get("devices", [])]
         _alerts = [_alert_from_dict(item) for item in document.get("alerts", [])]
+        raw_network = document.get("network")
+        _network = dict(raw_network) if isinstance(raw_network, dict) else None
         _seq["device"] = max(int(document.get("device_seq", 0)), max((d.id for d in _devices), default=0))
         _seq["alert"] = max(int(document.get("alert_seq", 0)), max((a.id for a in _alerts), default=0))
         _last_saved = json.dumps(_state_body(), sort_keys=True)
@@ -351,6 +355,48 @@ def devices() -> list[Device]:
 def alerts() -> list[Alert]:
     load()
     return _alerts
+
+
+def get_network() -> dict | None:
+    """The network the stored inventory belongs to, or None on first run.
+
+    Shape: ``{"cidr": ..., "gateway": ..., "ssid": ..., "bssid": ...}``.
+    A copy is returned so callers cannot mutate the stored value without
+    going through :func:`set_network` (which keeps ``save()`` change
+    detection accurate). Old documents written before this field existed
+    report None, which callers treat as "unknown — adopt, don't wipe".
+    """
+    load()
+    with _lock:
+        return dict(_network) if _network else None
+
+
+def set_network(info: dict | None) -> None:
+    """Remember which network the in-memory inventory belongs to.
+
+    Does not persist by itself — the caller saves (``save()`` picks the new
+    value up through ``_state_body``) so a network change and the inventory
+    wipe stay one atomic Storage upload.
+    """
+    with _lock:
+        global _network
+        _network = dict(info) if info else None
+
+
+def clear_inventory() -> dict:
+    """Drop every stored device and alert (old network is gone).
+
+    Must be called inside :func:`transaction`. Returns the removal counts so
+    callers can log and report them. Persistence is left to the caller —
+    ``save()`` rewrites ``state.json`` in Supabase Storage, which is what
+    removes the old-network rows from Storage as well as from memory.
+    """
+    with _lock:
+        removed_devices = len(_devices)
+        removed_alerts = len(_alerts)
+        _devices.clear()
+        _alerts.clear()
+        return {"devices": removed_devices, "alerts": removed_alerts}
 
 
 def next_device_id() -> int:

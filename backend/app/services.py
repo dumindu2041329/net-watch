@@ -11,10 +11,13 @@ from .events import get_broker
 from .monitor import BandwidthSampler, ProtocolMonitor
 from .scanner import (
     arp_probe,
+    classify_device,
+    enrich_entries,
     get_default_gateway,
     get_network_cidr,
+    l2_sweep,
+    oui_vendor,
     ping_host,
-    run_discovery,
     usable_unicast_mac,
 )
 from .snmp import LanTrafficSampler
@@ -35,6 +38,12 @@ lan_traffic = LanTrafficSampler()
 
 _gateway_cache: dict[str, float] = {"ip": "", "ts": 0.0}
 _GATEWAY_CACHE_TTL = 30.0
+
+# Serializes full discovery scans: the scheduled scan, a manual POST /api/scan
+# and the ping-cycle network watcher below can all fire at once. Waiting
+# holders would stack behind a 15-20 s scan, so trigger paths check
+# `locked()` first and skip instead of queueing.
+_scan_lock = asyncio.Lock()
 
 
 def current_gateway() -> str:
@@ -351,58 +360,298 @@ def _upsert_device(entry: dict):
     return device, is_new
 
 
+def _norm_bssid(value: str | None) -> str:
+    """Upper-case colon-separated BSSID, or "" when missing."""
+    return (value or "").strip().upper().replace("-", ":")
+
+
+def _is_hotspot_bssid(bssid: str) -> bool:
+    """True for locally-administered (randomized) AP MACs — phone hotspots."""
+    try:
+        return bool(int(bssid[:2], 16) & 0x02)
+    except (ValueError, IndexError):
+        return False
+
+
+def _current_wifi_identity() -> dict:
+    """Best-effort SSID/BSSID of the active uplink (never raises)."""
+    try:
+        from .wifi import wifi_payload
+
+        info = wifi_payload() or {}
+    except Exception:
+        return {"ssid": "", "bssid": ""}
+    if not info.get("connected"):
+        return {"ssid": "", "bssid": ""}
+    return {"ssid": (info.get("ssid") or "").strip(), "bssid": _norm_bssid(info.get("bssid"))}
+
+
+def _network_fingerprint(cidr: str, gateway: str, wifi: dict) -> dict:
+    """Identity of the LAN the scan just ran on."""
+    return {
+        "cidr": (cidr or "").strip(),
+        "gateway": (gateway or "").strip(),
+        "ssid": (wifi.get("ssid") or "").strip(),
+        "bssid": _norm_bssid(wifi.get("bssid")),
+    }
+
+
+def _network_changed(old: dict | None, new: dict) -> bool:
+    """True when `new` is positively a different LAN than `old`.
+
+    A missing piece of evidence is never a change: an empty gateway/SSID only
+    means detection failed (or the link is down), not that the network moved.
+    The BSSID alone never triggers — roaming between APs of one SSID keeps the
+    same LAN — except when both BSSIDs are hotspot-style randomized MACs with
+    an equal SSID, i.e. two different phones sharing one hotspot name.
+    """
+    if not old:
+        return False
+    if new.get("cidr") and old.get("cidr") and new["cidr"] != old["cidr"]:
+        return True
+    if new.get("gateway") and old.get("gateway") and new["gateway"] != old["gateway"]:
+        return True
+    new_ssid = (new.get("ssid") or "").strip()
+    old_ssid = (old.get("ssid") or "").strip()
+    if new_ssid and old_ssid and new_ssid != old_ssid:
+        return True
+    new_bssid = _norm_bssid(new.get("bssid"))
+    old_bssid = _norm_bssid(old.get("bssid"))
+    if new_bssid and old_bssid and new_bssid != old_bssid:
+        same_ssid = bool(new_ssid and old_ssid and new_ssid == old_ssid)
+        if same_ssid and _is_hotspot_bssid(new_bssid) and _is_hotspot_bssid(old_bssid):
+            return True
+        if not new_ssid and not old_ssid:
+            # No SSID to anchor on (non-WiFi uplinks report none): a different
+            # AP MAC together with an otherwise identical fingerprint is still
+            # the same LAN, so only hotspot-style BSSIDs count here as well.
+            return _is_hotspot_bssid(new_bssid) and _is_hotspot_bssid(old_bssid)
+    return False
+
+
+def _merge_network(old: dict | None, new: dict) -> dict:
+    """Fold `new` into `old`, keeping good values a thin scan left blank."""
+    merged = dict(old) if old else {}
+    for key, value in new.items():
+        if value:
+            merged[key] = value
+        elif key not in merged:
+            merged[key] = value
+    return merged
+
+
 async def run_scan() -> dict:
     """Full discovery cycle. Returns ScanResult-shaped payload."""
-    start = time.perf_counter()
-    cidr = await asyncio.to_thread(get_network_cidr)
-    found = await asyncio.to_thread(run_discovery, cidr)
+    async with _scan_lock:
+        return await _run_scan_locked()
+
+
+async def _detect_network_change_and_rescan() -> bool:
+    """Trigger a full scan the moment the uplink moves (ping-cycle watcher).
+
+    The scheduled discovery only runs every 30 s, so without this a physical
+    network switch would leave the Devices page showing a half-cleared list
+    (often just the gateway, the first host to answer on the fresh LAN)
+    until the next cycle. The ping job runs every 5 s, so a cheap fingerprint
+    check here cuts the reaction to seconds. Returns True when a rescan was
+    started — the caller should skip its own work and let the scan publish.
+    """
+    if _scan_lock.locked():
+        return False
+    try:
+        cidr, gateway, wifi_identity = await asyncio.gather(
+            asyncio.to_thread(get_network_cidr),
+            asyncio.to_thread(get_default_gateway),
+            asyncio.to_thread(_current_wifi_identity),
+        )
+    except Exception:
+        return False
+    fingerprint = _network_fingerprint(cidr, gateway, wifi_identity)
+    previous = store.get_network()
+    uplink_present = bool(fingerprint.get("gateway") or fingerprint.get("ssid"))
+    if previous and uplink_present and _network_changed(previous, fingerprint):
+        logger.info("Network watcher detected change %s -> %s — rescanning now", previous, fingerprint)
+        await run_scan()
+        return True
+    return False
+
+
+def _skeleton_entry(ip: str, mac: str, gateway: str) -> dict:
+    """Fast L2-only entry: IP/MAC/vendor/type with no network round-trips.
+
+    Published immediately so the Devices page shows MAC addresses and vendors
+    seconds after a network change; reverse DNS, TTL/OS and port scans fill in
+    with the enrichment publish. L2 presence (an ARP reply or a sweep hit) is
+    evidence of life, so the row starts "up" — the same rule the enricher
+    applies to MAC-bearing hosts.
+    """
+    norm = _norm_mac(mac)
+    vendor = oui_vendor(norm) if norm else ""
+    return {
+        "ip": ip,
+        "mac": norm,
+        "hostname": "",
+        "vendor": vendor,
+        "device_type": classify_device(ip, gateway or "", norm, "", None, vendor),
+        "os": "",
+        "status": "up",
+    }
+
+
+def _upsert_found(entries: list[dict]) -> int:
+    """Upsert discovery entries plus new-device alerts. Returns new count.
+
+    Entries carrying a MAC go first: the MAC is a device's identity, so it
+    must claim or re-key its row before an IP-only entry falls back to
+    whatever row is currently sitting on that IP. Must run inside
+    ``store.transaction()``.
+    """
     new_devices = 0
-    found_ips = {e["ip"] for e in found}
-    with store.transaction():
-        devices = store.devices()
-        # Entries carrying a MAC first: the MAC is a device's identity, so it
-        # must claim or re-key its row before an IP-only entry falls back to
-        # whatever row is currently sitting on that IP.
-        for entry in sorted(found, key=lambda e: not _norm_mac(e.get("mac"))):
-            device, is_new = _upsert_device(entry)
-            if is_new:
-                new_devices += 1
-                store.add_alert(
-                    level="new",
-                    message=f"{display_name(device)} ({device.ip_address}) — New device joined network",
-                    device_ip=device.ip_address,
-                )
-        if found:
-            # Keep only real, currently connected devices: drop anything that
-            # was not seen in this discovery AND has been quiet past the grace
-            # window. Wireless clients (phones, IoT behind home broadband
-            # routers) sleep often and vanish from ARP/ping briefly, so a
-            # single missed scan is not proof of disconnection.
-            grace_cutoff = utcnow() - timedelta(seconds=settings.stale_device_grace_sec)
-            stale = [
-                d
-                for d in devices
-                if d.ip_address not in found_ips and (d.last_seen or utcnow()) < grace_cutoff
+    for entry in sorted(entries, key=lambda e: not _norm_mac(e.get("mac"))):
+        device, is_new = _upsert_device(entry)
+        if is_new:
+            new_devices += 1
+            store.add_alert(
+                level="new",
+                message=f"{display_name(device)} ({device.ip_address}) — New device joined network",
+                device_ip=device.ip_address,
+            )
+    return new_devices
+
+
+def _prune_missing(found_ips: set, network_changed: bool) -> None:
+    """Drop rows the discovery did not see. Must run inside ``store.transaction()``."""
+    devices = store.devices()
+    if network_changed:
+        # The old LAN is gone: anything the new discovery did not see
+        # belongs to it, grace window or not. The Devices page must not
+        # keep showing the previous network's hosts.
+        if found_ips:
+            devices[:] = [d for d in devices if d.ip_address in found_ips]
+        else:
+            devices.clear()
+        if found_ips:
+            store.alerts()[:] = [
+                a for a in store.alerts() if not a.device_ip or a.device_ip in found_ips
             ]
-            if stale:
-                stale_ips = {d.ip_address for d in stale}
-                stale_ids = {d.id for d in stale}
-                devices[:] = [d for d in devices if d.id not in stale_ids]
-                store.alerts()[:] = [a for a in store.alerts() if a.device_ip not in stale_ips]
+    elif found_ips:
+        # Keep only real, currently connected devices: drop anything that
+        # was not seen in this discovery AND has been quiet past the grace
+        # window. Wireless clients (phones, IoT behind home broadband
+        # routers) sleep often and vanish from ARP/ping briefly, so a
+        # single missed scan is not proof of disconnection.
+        grace_cutoff = utcnow() - timedelta(seconds=settings.stale_device_grace_sec)
+        stale = [
+            d
+            for d in devices
+            if d.ip_address not in found_ips and (d.last_seen or utcnow()) < grace_cutoff
+        ]
+        if stale:
+            stale_ips = {d.ip_address for d in stale}
+            stale_ids = {d.id for d in stale}
+            devices[:] = [d for d in devices if d.id not in stale_ids]
+            store.alerts()[:] = [a for a in store.alerts() if a.device_ip not in stale_ips]
+
+
+async def _publish_inventory() -> None:
+    """Push the current devices/alerts/stats to every live client."""
+    await publish("devices", devices_payload())
+    await publish("alerts", alerts_payload())
+    await publish("stats", stats_payload())
+
+
+async def _run_scan_locked() -> dict:
+    """Full discovery cycle. Returns ScanResult-shaped payload."""
+    start = time.perf_counter()
+    cidr, gateway, wifi_identity = await asyncio.gather(
+        asyncio.to_thread(get_network_cidr),
+        asyncio.to_thread(get_default_gateway),
+        asyncio.to_thread(_current_wifi_identity),
+    )
+    fingerprint = _network_fingerprint(cidr, gateway, wifi_identity)
+    # Refresh the gateway cache with the fresh lookup so is_gateway flags and
+    # SNMP polling use the new uplink immediately after a network change.
+    if gateway:
+        _gateway_cache["ip"] = gateway
+        _gateway_cache["ts"] = time.monotonic()
+    # Positive uplink evidence: without a gateway or an SSID the host may
+    # simply be disconnected, which must not wipe the last known inventory.
+    uplink_present = bool(fingerprint.get("gateway") or fingerprint.get("ssid"))
+    network_changed = False
+    cleared_devices = 0
+    with store.transaction():
+        previous = store.get_network()
+        if previous is None:
+            store.set_network(fingerprint)
+        elif _network_changed(previous, fingerprint) and uplink_present:
+            network_changed = True
+            removed = store.clear_inventory()
+            cleared_devices = removed["devices"]
+            # Re-anchor BEFORE upserting so the rows added below belong to the
+            # new LAN even if the process crashes mid-scan; the saves below
+            # then remove the old rows from Supabase Storage too.
+            store.set_network(fingerprint)
+            logger.info(
+                "Network changed from %s to %s — cleared %d old device(s) and %d alert(s)",
+                previous,
+                fingerprint,
+                removed["devices"],
+                removed["alerts"],
+            )
+            if removed["devices"] or removed["alerts"]:
+                store.add_alert(
+                    level="info",
+                    message=(
+                        f"Network changed ({previous.get('ssid') or previous.get('cidr') or 'unknown'} → "
+                        f"{fingerprint.get('ssid') or fingerprint.get('cidr') or 'unknown'}) — "
+                        f"cleared {removed['devices']} old device(s)"
+                    ),
+                )
+        else:
+            store.set_network(_merge_network(previous, fingerprint))
+    # Phase 1 (fast, seconds): L2 sweep needs no DNS/ping/ports, so MAC
+    # addresses and vendors are known as soon as ARP/ICMP answer. Upsert and
+    # publish them now instead of holding them behind the slow enrichment —
+    # otherwise the Devices page shows bare IPs for 10-20 s after every
+    # network change while hostnames and port scans grind through.
+    by_ip, l2_cache, l2_gateway = await asyncio.to_thread(l2_sweep, cidr)
+    scan_gateway = l2_gateway or gateway
+    skeletons = [
+        _skeleton_entry(ip, entry.get("mac") or l2_cache.get(ip, ""), scan_gateway)
+        for ip, entry in by_ip.items()
+    ]
+    found_ips = {s["ip"] for s in skeletons}
+    with store.transaction():
+        new_devices = _upsert_found(skeletons)
+        _prune_missing(found_ips, network_changed)
+    await _publish_inventory()
     await asyncio.to_thread(store.save)
+    # Phase 2 (slow): reverse DNS, TTL/OS fingerprint and port scan fill in
+    # the rows the skeleton just created (matched by MAC, so no duplicate
+    # new-device alerts). If enrichment ever fails, the skeleton published
+    # above already shows correct IPs, MACs and vendors.
+    try:
+        enriched = await asyncio.to_thread(enrich_entries, skeletons, scan_gateway, l2_cache)
+    except Exception:
+        logger.exception("Enrichment failed — keeping the L2 skeleton")
+        enriched = []
+    if enriched:
+        with store.transaction():
+            new_devices += _upsert_found(enriched)
+        await _publish_inventory()
+        await asyncio.to_thread(store.save)
     duration = int((time.perf_counter() - start) * 1000)
     result = {
         "status": "complete",
         "network_cidr": cidr,
-        "devices_found": len(found),
+        "devices_found": len(skeletons),
         "new_devices": new_devices,
         "scan_duration_ms": duration,
         "timestamp": iso_now(),
+        "network_changed": network_changed,
+        "cleared_devices": cleared_devices,
     }
     await publish("scan", result)
-    await publish("devices", devices_payload())
-    await publish("alerts", alerts_payload())
-    await publish("stats", stats_payload())
     return result
 
 
@@ -416,6 +665,16 @@ async def run_ping_cycle() -> None:
     flapped to "down". A device that answers neither ICMP nor ARP is marked
     offline on the very next cycle.
     """
+    # A discovery scan is already rebuilding the inventory — pinging the old
+    # rows now would only flap them down and spam unreachable alerts that the
+    # scan is about to clear anyway.
+    if _scan_lock.locked():
+        return
+    # Physical network switch: rescan immediately (5 s reaction) instead of
+    # waiting for the 30 s scheduled scan, so the Devices page never sits on
+    # a half-found list with only the gateway.
+    if await _detect_network_change_and_rescan():
+        return
     devices = store.devices()
     if not devices:
         return

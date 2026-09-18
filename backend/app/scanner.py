@@ -512,27 +512,81 @@ def _enrich_entry(entry: dict, gateway: str, arp_cache: dict[str, str] | None = 
     return entry
 
 
-def run_discovery(cidr: str) -> list[dict]:
-    """Full discovery: ARP scan first, ping sweep fallback, then enrich.
+def l2_sweep(cidr: str, ping_concurrency: int = 128) -> tuple[dict[str, dict], dict, str]:
+    """Fast Layer-2 sweep: no DNS, no per-host ping, no port scan.
 
-    The system ARP cache is always merged in (one `arp -a` call per run).
-    On wireless home networks many clients sleep through ICMP and ARP
-    probes but remain registered in the cache, so they are still shown as
-    connected devices.
+    Returns ``(by_ip, cache, gateway)`` where ``by_ip`` maps IP →
+    ``{"ip", "mac"}`` (MAC may be "" when neither the probes nor the ARP
+    cache resolved it), ``cache`` is the merged ARP IP → MAC map, and
+    ``gateway`` is the default gateway IP.
+
+    All three sources are always merged. The ARP scan alone is not enough:
+    without admin rights it returns nothing, and even with rights only a
+    subset of hosts answers before the timeout (often just the gateway) —
+    the ping sweep picks up the hosts the ARP sweep missed. Conversely the
+    ping sweep alone misses hosts that silently drop ICMP, so the system ARP
+    cache is merged in as well. The cache is read both before probing (warm
+    entries from earlier traffic) and after (hosts whose ARP resolved while
+    the ping sweep ran, even when their ICMP echo was filtered), so a fresh
+    network populates on the very first scan instead of showing only the
+    gateway until later cycles.
     """
-    cache = arp_table()
+    cache_before = arp_table()
     by_ip: dict[str, dict] = {}
-    for entry in arp_scan(cidr):
+
+    # ARP and ICMP probes touch different stacks; run them together so one
+    # slow source never gates the other.
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        future_arp = pool.submit(arp_scan, cidr)
+        future_ping = pool.submit(ping_sweep, cidr, ping_concurrency)
+        try:
+            arp_entries = future_arp.result()
+        except Exception:
+            arp_entries = []
+        try:
+            ping_entries = future_ping.result()
+        except Exception:
+            ping_entries = []
+    for entry in arp_entries:
         by_ip.setdefault(entry["ip"], entry)
-    if not by_ip:
-        for entry in ping_sweep(cidr):
-            by_ip.setdefault(entry["ip"], entry)
+    for entry in ping_entries:
+        existing = by_ip.get(entry["ip"])
+        if existing is None:
+            by_ip[entry["ip"]] = entry
+        elif not existing.get("mac") and entry.get("mac"):
+            existing["mac"] = entry["mac"]
+
+    # Re-read after probing: ping traffic ARP-resolves live hosts even when
+    # they filter ICMP, so this catches the devices a pure ping sweep drops.
+    cache_after = arp_table()
+    cache = {**cache_before, **cache_after}
     for entry in arp_cache_hosts(cidr, cache):
         existing = by_ip.get(entry["ip"])
         if existing is None:
             by_ip[entry["ip"]] = entry
         elif not existing.get("mac") and entry.get("mac"):
             existing["mac"] = entry["mac"]
-    gateway = get_default_gateway()
+    return by_ip, cache, get_default_gateway()
+
+
+def enrich_entries(
+    entries: list[dict], gateway: str | None = None, cache: dict[str, str] | None = None
+) -> list[dict]:
+    """Fill hostname, vendor, TTL/OS, type and open ports for L2 entries.
+
+    This is the slow phase (reverse DNS with a 2 s timeout per host plus a
+    TCP port scan per reachable host). It mutates and returns ``entries`` so
+    callers can publish the fast L2 skeleton first and the details after.
+    """
+    if gateway is None:
+        gateway = get_default_gateway()
+    if cache is None:
+        cache = arp_table()
     with ThreadPoolExecutor(max_workers=16) as pool:
-        return list(pool.map(lambda e: _enrich_entry(e, gateway, cache), by_ip.values()))
+        return list(pool.map(lambda e: _enrich_entry(e, gateway, cache), entries))
+
+
+def run_discovery(cidr: str) -> list[dict]:
+    """Full discovery: L2 sweep first, then enrich (one blocking call)."""
+    by_ip, cache, gateway = l2_sweep(cidr)
+    return enrich_entries(list(by_ip.values()), gateway, cache)
