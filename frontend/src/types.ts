@@ -42,11 +42,15 @@ export interface TopologyNode {
   x: number;
   y: number;
   status: 'up' | 'warn' | 'down';
+  is_gateway?: boolean;
+  is_self?: boolean;
 }
 
 export interface TopologyData {
   nodes: TopologyNode[];
   edges: [string, string][];
+  gateway_ip?: string;
+  hotspot?: boolean;
 }
 
 export interface NetworkInterface {

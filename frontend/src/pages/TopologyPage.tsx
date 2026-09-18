@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useMemo, useCallback } from 'react'
 import type { TopologyData, TopologyNode } from '../types'
-import { getTopology } from '../api'
+import { getTopology, subscribeLive } from '../api'
 
 const VIEW_W = 1200
 const CORE_TYPES = new Set(['router', 'firewall', 'switch', 'ap'])
@@ -14,20 +14,57 @@ const TYPE_NAMES: Record<string, string> = {
   camera: 'Camera', voip: 'VoIP Phone', phone: 'Phone', tablet: 'Tablet', mobile: 'Mobile', device: 'Device',
 }
 
-/** Grid-style layout: core devices on a top row, everything else in rows below. */
-function defaultLayout(nodes: TopologyNode[]): Record<string, { x: number; y: number }> {
+/** Gateway-centric layout: the default gateway (router or hotspot phone) is the
+ * hub at the top, other infra devices form a second row, everything else —
+ * including this monitoring PC — hangs off the hub in rows below. This keeps
+ * standard Wi-Fi (router hub) and phone-hotspot/tethered uplinks (phone hub)
+ * on one rule instead of electing the hub from IP string order. */
+function defaultLayout(nodes: TopologyNode[], gatewayIp?: string): Record<string, { x: number; y: number }> {
   const pos: Record<string, { x: number; y: number }> = {}
-  const core = nodes.filter(n => CORE_TYPES.has(n.type))
-  const leaves = nodes.filter(n => !CORE_TYPES.has(n.type))
   const topY = 120
+  const isHub = (n: TopologyNode) => !!n.is_gateway || (!!gatewayIp && n.ip === gatewayIp)
+  const hub = nodes.find(isHub)
+  const otherCore = nodes.filter(n => !isHub(n) && CORE_TYPES.has(n.type))
+  const leaves = nodes.filter(n => !isHub(n) && !CORE_TYPES.has(n.type))
+
+  const layoutRow = (row: TopologyNode[], y: number) => {
+    if (row.length === 0) return
+    const span = row.length > 1 ? Math.min(260, (VIEW_W - 240) / (row.length - 1)) : 0
+    // Widest leaf rows need tighter spacing than the narrow core row.
+    const tight = row.length > 4 ? Math.min(200, (VIEW_W - 160) / (row.length - 1)) : span
+    row.forEach((n, i) => {
+      pos[n.id] = { x: VIEW_W / 2 + (i - (row.length - 1) / 2) * tight, y }
+    })
+  }
+
+  if (hub) {
+    pos[hub.id] = { x: VIEW_W / 2, y: topY }
+    const secondY = topY + 190
+    layoutRow(otherCore, secondY)
+    const leavesStartY = secondY + (otherCore.length ? 190 : 0) + (otherCore.length ? 0 : 0)
+    const startY = otherCore.length ? leavesStartY : topY + 190
+    const cols = Math.max(1, Math.min(6, leaves.length))
+    const colSpan = Math.min(200, (VIEW_W - 160) / (cols > 1 ? cols - 1 : 1))
+    const rowGap = 180
+    leaves.forEach((n, i) => {
+      const r = Math.floor(i / cols)
+      const c = i % cols
+      const inRow = Math.min(cols, leaves.length - r * cols)
+      pos[n.id] = { x: VIEW_W / 2 + (c - (inRow - 1) / 2) * colSpan, y: startY + r * rowGap }
+    })
+    return pos
+  }
+
+  const core = nodes.filter(n => CORE_TYPES.has(n.type))
+  const rest0 = nodes.filter(n => !CORE_TYPES.has(n.type))
 
   core.forEach((n, i) => {
     const span = core.length > 1 ? Math.min(260, (VIEW_W - 240) / (core.length - 1)) : 0
     pos[n.id] = { x: VIEW_W / 2 + (i - (core.length - 1) / 2) * span, y: topY }
   })
 
-  if (core.length === 0 && leaves.length) pos[leaves[0].id] = { x: VIEW_W / 2, y: topY }
-  const rest = core.length === 0 ? leaves.slice(1) : leaves
+  if (core.length === 0 && rest0.length) pos[rest0[0].id] = { x: VIEW_W / 2, y: topY }
+  const rest = core.length === 0 ? rest0.slice(1) : rest0
 
   const cols = Math.max(1, Math.min(6, rest.length))
   const colSpan = Math.min(200, (VIEW_W - 160) / (cols > 1 ? cols - 1 : 1))
@@ -181,14 +218,14 @@ function Glyph({ type, color }: { type: string; color: string }) {
 }
 
 /** Merge freshly laid-out defaults with positions the user has dragged. */
-function mergePositions(prev: Record<string, { x: number; y: number }>, nodes: TopologyNode[]): Record<string, { x: number; y: number }> {
-  const defaults = defaultLayout(nodes)
+function mergePositions(prev: Record<string, { x: number; y: number }>, nodes: TopologyNode[], gatewayIp?: string): Record<string, { x: number; y: number }> {
+  const defaults = defaultLayout(nodes, gatewayIp)
   const next: Record<string, { x: number; y: number }> = {}
   for (const n of nodes) next[n.id] = prev[n.id] ?? defaults[n.id]
   return next
 }
 
-export default function TopologyPage() {
+export default function TopologyPage({ scanVersion, token }: { scanVersion?: number; token?: string }) {
   const [topo, setTopo] = useState<TopologyData>({ nodes: [], edges: [] })
   const [positions, setPositions] = useState<Record<string, { x: number; y: number }>>({})
   const [selected, setSelected] = useState<TopologyNode | null>(null)
@@ -196,15 +233,41 @@ export default function TopologyPage() {
   const svgRef = useRef<SVGSVGElement>(null)
   const dragRef = useRef<{ id: string; dx: number; dy: number; startX: number; startY: number; moved: boolean } | null>(null)
 
-  useEffect(() => {
+  const fetchTopology = useCallback(() => {
     getTopology()
       .then(data => {
         setTopo(data)
-        setPositions(prev => mergePositions(prev, data.nodes))
+        setPositions(prev => mergePositions(prev, data.nodes, data.gateway_ip))
+        // Drop a selection pointing at a host from the previous network —
+        // after a network change its id no longer exists in the inventory.
         setSelected(sel => (sel && data.nodes.some(n => n.id === sel.id) ? sel : null))
       })
       .catch(() => {})
   }, [])
+
+  // Poll so routine discoveries (new device on the same network) render
+  // without a manual refresh — same 5 s rhythm as the Devices page.
+  useEffect(() => {
+    fetchTopology()
+    const id = setInterval(fetchTopology, 5000)
+    return () => clearInterval(id)
+  }, [fetchTopology, token])
+
+  // Live push: every completed discovery publishes a `scan` event (the
+  // network watcher also triggers one seconds after a physical switch), so
+  // the map rebuilds ~1 s after a network change instead of waiting for the
+  // next poll. Manual scans bump `scanVersion` in App and refetch below.
+  useEffect(() => {
+    const unsub = subscribeLive((e) => {
+      if (e.type !== 'scan') return
+      fetchTopology()
+    })
+    return unsub
+  }, [fetchTopology])
+
+  useEffect(() => {
+    if (scanVersion && scanVersion > 0) fetchTopology()
+  }, [scanVersion, fetchTopology])
 
   // Responsive canvas height: always large enough to fit every node.
   const viewH = useMemo(() => {
@@ -261,11 +324,26 @@ export default function TopologyPage() {
 
   const statusColor = (s: string) => s === 'up' ? 'bg-accent2/12 text-accent2 border-accent2/30' : s === 'warn' ? 'bg-warn/12 text-warn border-warn/30' : 'bg-danger/12 text-danger border-danger/30'
 
+  const hub = topo.nodes.find(n => n.is_gateway || (!!topo.gateway_ip && n.ip === topo.gateway_ip))
+  const hubLabel = hub ? hub.label : null
+
   return (
     <>
       <div className="font-display font-extrabold text-2xl text-text-noc tracking-[2px] mb-5 flex items-center gap-3">
         {'\u25C9'} <span className="text-accent">Network</span> Topology
       </div>
+
+      {topo.nodes.length > 0 && (
+        <div className="mb-4 rounded-[10px] border border-border-noc bg-panel px-[18px] py-3 text-[12.5px] leading-relaxed text-muted">
+          {topo.hotspot ? (
+            <span><b className="text-accent">Hotspot uplink{hubLabel ? ` · ${hubLabel}` : ''}.</b> The phone is the central access point — this computer and every other device connect directly to the phone{topo.gateway_ip ? ` (${topo.gateway_ip})` : ''}, exactly like devices connect to the router on standard Wi-Fi.</span>
+          ) : hub ? (
+            <span><b className="text-accent">Infrastructure uplink{hubLabel ? ` · ${hubLabel}` : ''}.</b> All devices connect directly to the hub{topo.gateway_ip ? ` (${topo.gateway_ip})` : ''}.</span>
+          ) : (
+            <span>Hub not detected yet — showing discovered devices without a centre node.</span>
+          )}
+        </div>
+      )}
 
       <div className="bg-panel border border-border-noc rounded-[10px] overflow-hidden mb-4">
         <div className="flex items-center justify-between px-[18px] py-3.5 border-b border-border-noc bg-panel2">
@@ -310,6 +388,7 @@ export default function TopologyPage() {
               const color = STATUS_COLOR[n.status] || '#00d4ff'
               const isDragging = draggingId === n.id
               const isSel = selected?.id === n.id
+              const isHub = !!n.is_gateway || (!!topo.gateway_ip && n.ip === topo.gateway_ip)
               return (
                 <g
                   key={n.id}
@@ -323,12 +402,20 @@ export default function TopologyPage() {
                   {isSel && (
                     <rect x="-6" y="-6" width="56" height="62" rx="10" fill="none" stroke="rgba(0,212,255,0.6)" strokeWidth="1.6" strokeDasharray="5 4" />
                   )}
+                  {isHub && !isSel && (
+                    <rect x="-4" y="-4" width="52" height="52" rx="10" fill="none" stroke="rgba(0,212,255,0.35)" strokeWidth="1.2" />
+                  )}
                   <g style={{ filter: isDragging ? 'drop-shadow(0 0 6px rgba(0,212,255,0.6))' : undefined }}>
                     <Glyph type={n.type} color={color} />
                   </g>
                   <text x="22" y="50" textAnchor="middle" fontSize="12" fontFamily="'Share Tech Mono',monospace" fontWeight="600" fill={isSel ? '#00d4ff' : '#d7e8f8'} style={{ pointerEvents: 'none' }}>{n.label}</text>
                   {n.label !== n.ip && (
                     <text x="22" y="63" textAnchor="middle" fontSize="9.5" fontFamily="'Share Tech Mono',monospace" fill="rgba(150,190,225,0.55)" style={{ pointerEvents: 'none' }}>{n.ip}</text>
+                  )}
+                  {(isHub || n.is_self) && (
+                    <text x="22" y="-8" textAnchor="middle" fontSize="9" fontFamily="'Share Tech Mono',monospace" fontWeight="700" fill="rgba(0,212,255,0.85)" style={{ pointerEvents: 'none' }}>
+                      {isHub ? (topo.hotspot ? 'HOTSPOT · HUB' : 'HUB') : 'THIS PC'}
+                    </text>
                   )}
                 </g>
               )
@@ -382,6 +469,14 @@ export default function TopologyPage() {
                   </div>
                 </div>
                 <div>IP: <b className="text-accent font-mono-noc">{selected.ip}</b></div>
+                <div className="flex flex-wrap items-center gap-2">
+                  {(selected.is_gateway || (!!topo.gateway_ip && selected.ip === topo.gateway_ip)) && (
+                    <span className="inline-flex items-center gap-[5px] px-2.5 py-[3px] rounded-[12px] text-[11px] font-semibold border bg-accent/12 text-accent border-accent/30">{topo.hotspot ? 'HOTSPOT HUB' : 'NETWORK HUB'}</span>
+                  )}
+                  {selected.is_self && (
+                    <span className="inline-flex items-center gap-[5px] px-2.5 py-[3px] rounded-[12px] text-[11px] font-semibold border bg-accent2/12 text-accent2 border-accent2/30">THIS PC</span>
+                  )}
+                </div>
                 <div>Status: <span className={`inline-flex items-center gap-[5px] px-2.5 py-[3px] rounded-[12px] text-[11px] font-semibold border ${statusColor(selected.status)}`}>{selected.status.toUpperCase()}</span></div>
               </div>
             ) : 'Click on any device node to view details. Drag nodes to rearrange the map.'}

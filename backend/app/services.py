@@ -14,6 +14,7 @@ from .scanner import (
     classify_device,
     enrich_entries,
     get_default_gateway,
+    get_local_ips,
     get_network_cidr,
     l2_sweep,
     oui_vendor,
@@ -219,51 +220,143 @@ _TYPE_MAP = {
 }
 
 
-def topology_payload() -> dict:
-    devices = sorted(store.devices(), key=lambda d: d.ip_address)
-    if not devices:
-        return {"nodes": [], "edges": []}
+def _ip_sort_key(ip: str) -> tuple:
+    """Numeric IPv4 sort key (lexicographic order misplaces .10 before .2 and
+    used to elect the wrong centre node on hotspot subnets)."""
+    try:
+        import ipaddress
 
-    core = [d for d in devices if d.device_type in _CORE_TYPES or d.ip_address.endswith(".1") or d.ip_address.endswith(".254")]
+        return (0, int(ipaddress.ip_address(ip.strip())))
+    except Exception:
+        return (1, ip or "")
+
+
+def _hotspot_uplink_active() -> bool:
+    """True when this host's own uplink is a phone hotspot (best-effort)."""
+    try:
+        from .wifi import wifi_payload
+
+        info = wifi_payload() or {}
+    except Exception:
+        return False
+    if info.get("hotspot_active"):
+        return True
+    return _is_hotspot_bssid(_norm_bssid(info.get("bssid")))
+
+
+def topology_payload() -> dict:
+    """Gateway-centric star: the default gateway is always the centre.
+
+    The previous heuristic elected the centre from ``.1``/``.254`` suffixes
+    (with a lexicographic fallback), so on phone-hotspot/tethered subnets —
+    e.g. Android USB tethering via 192.168.42.129, iPhone via 172.20.10.1 —
+    the monitoring PC (or any low-sorting leaf) could become the hub and the
+    remaining devices were drawn hanging off the computer instead of the
+    phone. Standard Wi-Fi and hotspot uplinks now share one rule: the phone
+    (or router) that owns the default route is the hub, and every other host
+    — including this monitoring PC — attaches directly to it.
+    """
+    devices = sorted(store.devices(), key=lambda d: _ip_sort_key(d.ip_address))
+    if not devices:
+        return {"nodes": [], "edges": [], "gateway_ip": "", "hotspot": False}
+
+    gateway_ip = ""
+    try:
+        gateway_ip = (current_gateway() or "").strip()
+    except Exception:
+        gateway_ip = ""
+    try:
+        local_ips = get_local_ips() or set()
+    except Exception:
+        local_ips = set()
+    hotspot = _hotspot_uplink_active()
+
+    by_id = {d.id: d for d in devices}
+    gateway_device = next((d for d in devices if gateway_ip and d.ip_address == gateway_ip), None)
+
+    core = [
+        d
+        for d in devices
+        if d.device_type in _CORE_TYPES
+        or (d.device_type or "").strip().lower() == "gateway"
+        or (gateway_ip and d.ip_address == gateway_ip)
+        or d.ip_address.endswith(".1")
+        or d.ip_address.endswith(".254")
+    ]
+    # The gateway owns the default route: it leads the core row even when its
+    # address carries no ".1" hint (phone tethering) and even when numeric
+    # sorting would otherwise put another host first.
+    core.sort(
+        key=lambda d: (
+            0 if gateway_device is not None and d.id == gateway_device.id else 1,
+            _ip_sort_key(d.ip_address),
+        )
+    )
     leaves = [d for d in devices if d not in core]
+    # Leaves (and any non-gateway core) attach to the gateway when it is
+    # known; otherwise fall back to the first core / self / first host.
+    parent: Device | None = gateway_device
+    if parent is None and core:
+        parent = core[0]
+    if parent is None:
+        self_node = next((d for d in devices if d.ip_address in local_ips), None)
+        parent = self_node or (devices[0] if devices else None)
 
     nodes: list[dict] = []
     edges: list[list[str]] = []
     core_positions = [(450, 60), (450, 160), (450, 260)]
     for i, d in enumerate(core):
         x, y = core_positions[i % len(core_positions)]
-        nodes.append(_topology_node(d, x, y))
+        nodes.append(_topology_node(d, x, y, gateway_ip, local_ips, hotspot))
 
     leaf_cols = [200, 310, 420, 530, 640, 750]
     for i, d in enumerate(leaves):
         x = leaf_cols[i % len(leaf_cols)]
         y = 340 + (i // len(leaf_cols)) * 130
-        nodes.append(_topology_node(d, x, y))
+        nodes.append(_topology_node(d, x, y, gateway_ip, local_ips, hotspot))
 
     if core:
         for i in range(len(core) - 1):
             edges.append([f"d{core[i].id}", f"d{core[i + 1].id}"])
-        parent = f"d{core[0].id}"
-    elif leaves:
-        parent = f"d{leaves[0].id}"
+        # Gateway leads `core`, so core[0] is the hub whenever the gateway
+        # is in the inventory; `parent` pins the same hub for the star below.
+        hub_id = f"d{parent.id}" if parent is not None else f"d{core[0].id}"
+    elif parent is not None:
+        hub_id = f"d{parent.id}"
     else:
-        parent = None
-    if parent:
+        hub_id = None
+    if hub_id:
         for d in leaves:
-            edges.append([parent, f"d{d.id}"])
-    return {"nodes": nodes, "edges": edges}
+            edges.append([hub_id, f"d{d.id}"])
+    # Drop any edge that references a device that no longer exists (stale id
+    # after a network-change wipe) so the frontend never draws dangling lines.
+    node_ids = {n["id"] for n in nodes}
+    edges = [e for e in edges if e[0] in node_ids and e[1] in node_ids]
+    _ = by_id
+    return {"nodes": nodes, "edges": edges, "gateway_ip": gateway_ip, "hotspot": hotspot}
 
 
-def _topology_node(device: Device, x: int, y: int) -> dict:
+def _topology_node(
+    device: Device, x: int, y: int, gateway_ip: str = "", local_ips: set | None = None, hotspot: bool = False
+) -> dict:
     status = device.status if device.status in ("up", "warn", "down") else "down"
+    node_type = _TYPE_MAP.get(device.device_type, "device")
+    is_gateway = bool(gateway_ip and device.ip_address == gateway_ip)
+    # A phone hotspot hosts the default route from a handset: draw the hub
+    # with the phone glyph (not the wired-router glyph) so hotspot and
+    # standard Wi-Fi centres are visually distinct.
+    if is_gateway and hotspot and node_type in ("router", "device", "mobile"):
+        node_type = "phone"
     return {
         "id": f"d{device.id}",
         "label": device.hostname or device.ip_address,
         "ip": device.ip_address,
-        "type": _TYPE_MAP.get(device.device_type, "device"),
+        "type": node_type,
         "x": x,
         "y": y,
         "status": status,
+        "is_gateway": is_gateway,
+        "is_self": bool(local_ips and device.ip_address in local_ips),
     }
 
 

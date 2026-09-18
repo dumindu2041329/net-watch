@@ -115,6 +115,42 @@ def get_network_cidr() -> str:
     return str(private[0] if private else candidates[0])
 
 
+def get_local_ips() -> set[str]:
+    """IPv4 addresses assigned to this host (non-loopback, best-effort).
+
+    Used by the topology map to mark the monitoring computer itself, so a
+    phone-hotspot/tethered uplink can be drawn as phone -> this PC instead of
+    guessing the centre from lexicographic IP order.
+    """
+    found: set[str] = set()
+    try:
+        import psutil
+
+        for _name, addrs in psutil.net_if_addrs().items():
+            for addr in addrs:
+                if addr.family != socket.AF_INET:
+                    continue
+                ip = (addr.address or "").strip()
+                if not ip or ip.startswith("127."):
+                    continue
+                try:
+                    parsed = ipaddress.ip_address(ip)
+                except ValueError:
+                    continue
+                if parsed.is_loopback or parsed.is_link_local or parsed.is_multicast:
+                    continue
+                found.add(ip)
+    except Exception:
+        pass
+    if not found:
+        try:
+            found.add(socket.gethostbyname(socket.gethostname()))
+        except Exception:
+            pass
+    found.discard("127.0.0.1")
+    return found
+
+
 def get_default_gateway() -> str:
     """Best-effort default gateway IP via routing table (no admin needed).
 

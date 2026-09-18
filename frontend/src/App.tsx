@@ -145,6 +145,8 @@ export default function App() {
               <DashboardPage scanVersion={scanVersion} token={accessToken} />
             ) : activePage === 'devices' ? (
               <DevicesPage scanVersion={scanVersion} token={accessToken} />
+            ) : activePage === 'topology' ? (
+              <TopologyPage scanVersion={scanVersion} token={accessToken} />
             ) : activePage === 'alerts' ? (
               <AlertsPage key={alertFilter} initialFilter={alertFilter} />
             ) : (
